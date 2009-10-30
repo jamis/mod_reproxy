@@ -160,7 +160,6 @@ static int reproxy_request(request_rec *r, const char *url_list)
   int handled = 0;
   header_fixups *fixups = apr_pcalloc(r->pool, sizeof(header_fixups));
 
-ap_log_rerror(__FILE__, __LINE__, APLOG_DEBUG, 0, r, "BEFORE: content-type is >%s<", r->content_type);
   fixups->content_type = apr_pstrdup(r->pool, r->content_type);
 
   apr_table_unset(r->headers_in, reproxy_capabilities_header);
@@ -206,8 +205,12 @@ reproxy_unset_headers_filter(ap_filter_t *f, apr_bucket_brigade *b)
 {
   header_fixups *fixups = (header_fixups*)f->ctx;
 
-ap_log_error(__FILE__, __LINE__, APLOG_DEBUG, 0, f->r->server, "original content_type: %s", fixups->content_type);
-  ap_set_content_type(f->r, fixups->content_type);
+  if(!apr_table_get(f->r->notes, "reproxy-headers-fixed")) {
+    ap_set_content_type(f->r, fixups->content_type);
+
+    apr_table_set(f->r->notes, "reproxy-headers-fixed", "yes");
+  }
+
   return ap_pass_brigade(f->next, b);
 }
 
