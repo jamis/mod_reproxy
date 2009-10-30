@@ -12,7 +12,7 @@ task :install => :default do
 end
 
 task :restart do
-  sh "sudo /opt/local/apache2/bin/apachectl restart"
+  sh "sudo -p 'sudo password:' /opt/local/apache2/bin/apachectl restart"
 end
 
 task :all => [:install, :restart]
