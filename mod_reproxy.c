@@ -14,18 +14,50 @@ typedef struct header_fixups {
   char *content_type;
 } header_fixups;
 
-#define FIRST_CALL NULL
-#define NO_REPROXY ((void*)1)
-#define REPROXIED  ((void*)2)
+typedef struct reproxy_filter_info {
+  int state;
+} reproxy_filter_info;
 
-module AP_MODULE_DECLARE_DATA reproxy_module;
+#define FIRST_CALL 0
+#define NO_REPROXY 1
+#define REPROXIED  2
 
-static const char* reproxy_name = "reproxy-filter";
-static const char* unset_filter = "reproxy-unset-headers-filter";
+static const char* reproxy_name  = "reproxy-filter";
+static const char* unset_filter  = "reproxy-unset-headers-filter";
+static const char* headers_fixed = "reproxy-headers-fixed";
 
 static const char* reproxy_capabilities_header = "X-Proxy-Capabilities";
 static const char* reproxy_file_value = "reproxy-file";
 static const char* reproxy_url_header = "X-Reproxy-Url";
+
+static const command_rec reproxy_cmds[] = {
+  AP_INIT_FLAG("AllowReproxy", ap_set_flag_slot,
+    (void*)APR_OFFSETOF(reproxy_cfg, enabled), ACCESS_CONF,
+    "Allow downstream handlers to request reproxying")
+};
+
+static void*         reproxy_config_init(apr_pool_t* pool, char *x);
+static apr_status_t  reproxy_fixups(request_rec *r);
+static void          reproxy_insert_filter(request_rec *r);
+static proxy_worker* reproxy_initialize_worker(apr_pool_t *pool,
+                       proxy_server_conf *conf, server_rec *server,
+                       const char *url);
+static apr_status_t  reproxy_request_to(request_rec *r, const char *url);
+static const char*   get_reproxy_url(request_rec *r);
+static int           reproxy_request(request_rec *r, const char *url_list);
+static apr_status_t  reproxy_output_filter(ap_filter_t *f, apr_bucket_brigade *b);
+static apr_status_t  reproxy_unset_headers_filter(ap_filter_t *f, apr_bucket_brigade *b);
+static void          reproxy_hooks(apr_pool_t *pool);
+
+module AP_MODULE_DECLARE_DATA reproxy_module = {
+  STANDARD20_MODULE_STUFF,
+  reproxy_config_init,
+  NULL,
+  NULL,
+  NULL,
+  reproxy_cmds,
+  reproxy_hooks
+};
 
 static void*
 reproxy_config_init(apr_pool_t* pool, char *x)
@@ -63,7 +95,10 @@ reproxy_insert_filter(request_rec *r)
   reproxy_cfg *cfg = ap_get_module_config(r->per_dir_config, &reproxy_module);
 
   if(cfg->enabled) {
-    ap_add_output_filter(reproxy_name, NULL, r, r->connection);
+    reproxy_filter_info* info = apr_pcalloc(r->pool, sizeof(reproxy_filter_info));
+    info->state = FIRST_CALL;
+
+    ap_add_output_filter(reproxy_name, info, r, r->connection);
   }
 }
 
@@ -137,7 +172,8 @@ reproxy_request_to(request_rec *r, const char *url)
   return status;
 }
 
-static const char *get_reproxy_url(request_rec *r)
+static const char*
+get_reproxy_url(request_rec *r)
 {
   const char *reproxy_url = apr_table_get(r->headers_out, reproxy_url_header);
 
@@ -153,7 +189,8 @@ static const char *get_reproxy_url(request_rec *r)
   return reproxy_url;
 }
 
-static int reproxy_request(request_rec *r, const char *url_list)
+static int
+reproxy_request(request_rec *r, const char *url_list)
 {
   char *list = apr_pstrdup(r->pool, url_list);
   char *state, *url;
@@ -185,16 +222,16 @@ static int reproxy_request(request_rec *r, const char *url_list)
 static apr_status_t
 reproxy_output_filter(ap_filter_t *f, apr_bucket_brigade *b)
 {
-  if(f->ctx == FIRST_CALL) {
+  reproxy_filter_info* info = (reproxy_filter_info*)f->ctx;
+  if(info->state == FIRST_CALL) {
     const char *reproxy_url = get_reproxy_url(f->r);
 
     if(reproxy_url) {
+      info->state = REPROXIED;
       return reproxy_request(f->r, reproxy_url);
     } else {
-      f->ctx = NO_REPROXY;
+      info->state = NO_REPROXY;
     }
-  } else if(f->ctx == REPROXIED) {
-    return APR_SUCCESS;
   }
 
   return ap_pass_brigade(f->next, b);
@@ -205,10 +242,9 @@ reproxy_unset_headers_filter(ap_filter_t *f, apr_bucket_brigade *b)
 {
   header_fixups *fixups = (header_fixups*)f->ctx;
 
-  if(!apr_table_get(f->r->notes, "reproxy-headers-fixed")) {
+  if(!apr_table_get(f->r->notes, headers_fixed)) {
     ap_set_content_type(f->r, fixups->content_type);
-
-    apr_table_set(f->r->notes, "reproxy-headers-fixed", "yes");
+    apr_table_set(f->r->notes, headers_fixed, "yes");
   }
 
   return ap_pass_brigade(f->next, b);
@@ -222,19 +258,3 @@ reproxy_hooks(apr_pool_t *pool)
   ap_hook_fixups(reproxy_fixups, NULL, NULL, APR_HOOK_LAST);
   ap_hook_insert_filter(reproxy_insert_filter, NULL, NULL, APR_HOOK_LAST);
 }
-
-static const command_rec reproxy_cmds[] = {
-  AP_INIT_FLAG("AllowReproxy", ap_set_flag_slot,
-    (void*)APR_OFFSETOF(reproxy_cfg, enabled), ACCESS_CONF,
-    "Allow downstream handlers to request reproxying")
-};
-
-module AP_MODULE_DECLARE_DATA reproxy_module = {
-  STANDARD20_MODULE_STUFF,
-  reproxy_config_init,
-  NULL,
-  NULL,
-  NULL,
-  reproxy_cmds,
-  reproxy_hooks
-};
