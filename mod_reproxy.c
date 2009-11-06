@@ -1,3 +1,35 @@
+/* ---------------------------------------------------------------------------
+ * mod_reproxy
+ *
+ * An Apache2 module that implements support for the X-Reproxy-Url header, as
+ * originally implemented in Danga Interactive's "perlbal" load balancer
+ * (http://www.danga.com/perlbal/).
+ *
+ * If reproxying is enabled for a particular request (see the AllowReproxy
+ * configuration setting), mod_reproxy will set X-Proxy-Capabilities to
+ * "reproxy-file". A backend seeing that may respond with an X-Reproxy-Url
+ * header that contains a space-delimited list of one or more URL's.
+ *
+ * On receiving the response from the backend, mod_reproxy will parse the
+ * X-Reproxy-Url and will sequentially try each provided URL until one is
+ * successful.
+ *
+ * The backend may include the following response headers, which will be
+ * explicitly preserved in the reproxied response:
+ *
+ * - Content-Type
+ *
+ * The latest version of this module will be found here:
+ *
+ *   http://github.com/jamis/mod_reproxy
+ *
+ * ---------------------------------------------------------------------------
+ * This file is distributed under the terms of the MIT license by Jamis Buck,
+ * and is copyright (c) 2009 by the same. See the LICENSE file distributed
+ * with this file for the complete text of the license.
+ * ---------------------------------------------------------------------------
+ */
+
 #include <apr_strings.h>
 #include <httpd.h>
 #include <http_log.h>
@@ -6,25 +38,30 @@
 #include <http_request.h>
 #include <mod_proxy.h>
 
+/* The configuration data for this module */
 typedef struct reproxy_cfg {
-  int enabled;
+  int enabled; /* 0 if reproxying is disabled, non-zero otherwise */
 } reproxy_cfg;
 
+/* Container describing headers that should be copied into the reproxied
+ * response */
 typedef struct header_fixups {
-  char *content_type;
+  char *content_type; /* the content-type from the original response should
+                       * be preserved */
 } header_fixups;
 
+/* Information regarding the current status of the reproxy filter */
 typedef struct reproxy_filter_info {
-  int state;
+  int state; /* either FIRST_CALL, NO_REPROXY, or REPROXIED */
 } reproxy_filter_info;
 
 #define FIRST_CALL 0
 #define NO_REPROXY 1
 #define REPROXIED  2
 
-static const char* reproxy_name  = "reproxy-filter";
-static const char* unset_filter  = "reproxy-unset-headers-filter";
-static const char* headers_fixed = "reproxy-headers-fixed";
+static const char* reproxy_name       = "reproxy-filter";
+static const char* fix_headers_filter = "reproxy-fix-headers-filter";
+static const char* headers_fixed      = "reproxy-headers-fixed";
 
 static const char* reproxy_capabilities_header = "X-Proxy-Capabilities";
 static const char* reproxy_file_value = "reproxy-file";
@@ -46,7 +83,7 @@ static apr_status_t  reproxy_request_to(request_rec *r, const char *url);
 static const char*   get_reproxy_url(request_rec *r);
 static int           reproxy_request(request_rec *r, const char *url_list);
 static apr_status_t  reproxy_output_filter(ap_filter_t *f, apr_bucket_brigade *b);
-static apr_status_t  reproxy_unset_headers_filter(ap_filter_t *f, apr_bucket_brigade *b);
+static apr_status_t  reproxy_fix_headers_filter(ap_filter_t *f, apr_bucket_brigade *b);
 static void          reproxy_hooks(apr_pool_t *pool);
 
 module AP_MODULE_DECLARE_DATA reproxy_module = {
@@ -63,6 +100,8 @@ static void*
 reproxy_config_init(apr_pool_t* pool, char *x)
 {
   reproxy_cfg *cfg = apr_pcalloc(pool, sizeof(reproxy_cfg));
+  cfg->enabled = 0;
+
   return cfg;
 }
 
@@ -94,6 +133,10 @@ reproxy_insert_filter(request_rec *r)
 {
   reproxy_cfg *cfg = ap_get_module_config(r->per_dir_config, &reproxy_module);
 
+  /* if reproxying is enabled for this request, add the reproxy filter to the
+   * output filters. We set state to FIRST_CALL, so that the output headers
+   * will be parsed (looking for X-Reproxy-Url) the time the filter is invoked. */
+
   if(cfg->enabled) {
     reproxy_filter_info* info = apr_pcalloc(r->pool, sizeof(reproxy_filter_info));
     info->state = FIRST_CALL;
@@ -102,8 +145,15 @@ reproxy_insert_filter(request_rec *r)
   }
 }
 
+/* Creates and initializes a new proxy_worker instance. Much of this is lifted
+ * from different static functions in mod_proxy, so there is definitely some
+ * cargo-culting going on here. I'm not sure, for instance, whether it is
+ * safe (in the long run) to create and initialize workers this way, since
+ * mod_proxy itself seems to assume workers are cached in a worker pool,
+ * rather than created on-demand and discarded when the request finishes. */
 static proxy_worker*
-reproxy_initialize_worker(apr_pool_t *pool, proxy_server_conf *conf, server_rec *server, const char *url)
+reproxy_initialize_worker(apr_pool_t *pool, proxy_server_conf *conf,
+  server_rec *server, const char *url)
 {
   proxy_worker *worker;
   apr_status_t status;
@@ -151,7 +201,6 @@ reproxy_request_to(request_rec *r, const char *url)
   proxy_worker *worker = NULL;
   int status;
 
-  /* should probably do this during module init, so it is only done once */
   mod_proxy = ap_find_linked_module("mod_proxy.c");
   if(!mod_proxy) {
     ap_log_rerror(__FILE__, __LINE__, APLOG_ERR, 0, r, "mod_proxy not loaded");
@@ -197,11 +246,21 @@ reproxy_request(request_rec *r, const char *url_list)
   int handled = 0;
   header_fixups *fixups = apr_pcalloc(r->pool, sizeof(header_fixups));
 
+  /* remember the original declared content-type of the response, so we
+   * can restore it in the reproxied response */
   fixups->content_type = apr_pstrdup(r->pool, r->content_type);
 
+  /* remove the reproxy capabilities header, so that we don't need
+   * to worry about infinite reproxy loops */
   apr_table_unset(r->headers_in, reproxy_capabilities_header);
-  ap_add_output_filter(unset_filter, fixups, r, r->connection);
 
+  /* add the fix headers filter to the output filter list, so that we
+   * can restore the original content_type (and, potentially, other
+   * headers) to the response. */
+  ap_add_output_filter(fix_headers_filter, fixups, r, r->connection);
+
+  /* parse the url_list, which is a space-delimited list of potential
+   * urls that the response may be reproxied to. */
   while(url = apr_strtok(list, " ", &state)) {
     list = NULL;
     if(reproxy_request_to(r, url) == APR_SUCCESS) {
@@ -223,6 +282,11 @@ static apr_status_t
 reproxy_output_filter(ap_filter_t *f, apr_bucket_brigade *b)
 {
   reproxy_filter_info* info = (reproxy_filter_info*)f->ctx;
+
+  /* if this is the first time this filter has been called for this response,
+   * look for the reproxy url header and act on it, if it exists. otherwise,
+   * just pass the brigade to the next filter. */
+
   if(info->state == FIRST_CALL) {
     const char *reproxy_url = get_reproxy_url(f->r);
 
@@ -238,9 +302,12 @@ reproxy_output_filter(ap_filter_t *f, apr_bucket_brigade *b)
 }
 
 static apr_status_t
-reproxy_unset_headers_filter(ap_filter_t *f, apr_bucket_brigade *b)
+reproxy_fix_headers_filter(ap_filter_t *f, apr_bucket_brigade *b)
 {
   header_fixups *fixups = (header_fixups*)f->ctx;
+
+  /* if the headers have not yet been fixed for this response, then
+   * put each saved header back into the response */
 
   if(!apr_table_get(f->r->notes, headers_fixed)) {
     ap_set_content_type(f->r, fixups->content_type);
@@ -254,7 +321,7 @@ static void
 reproxy_hooks(apr_pool_t *pool)
 {
   ap_register_output_filter(reproxy_name, reproxy_output_filter, NULL, AP_FTYPE_RESOURCE);
-  ap_register_output_filter(unset_filter, reproxy_unset_headers_filter, NULL, AP_FTYPE_RESOURCE);
+  ap_register_output_filter(fix_headers_filter, reproxy_fix_headers_filter, NULL, AP_FTYPE_RESOURCE);
   ap_hook_fixups(reproxy_fixups, NULL, NULL, APR_HOOK_LAST);
   ap_hook_insert_filter(reproxy_insert_filter, NULL, NULL, APR_HOOK_LAST);
 }
