@@ -33,8 +33,8 @@ submit alternative build files (e.g. makefile, etc.).
 Enabling Reproxying
 -------------------
 
-By default, reproxying is disabled. However, you can enable it in <Directory>,
-<Files>, and <Location> contexts with the `AllowReproxy` setting:
+By default, reproxying is disabled. However, you can enable it in \<Directory\>,
+\<Files\>, and \<Location\> contexts with the `AllowReproxy` setting:
 
     <Location />
       AllowReproxy on
