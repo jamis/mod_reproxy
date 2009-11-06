@@ -1,0 +1,91 @@
+mod\_reproxy
+===========
+
+mod\_reproxy is an [Apache2](http://httpd.apache.org/) module that
+implements support for the X-Reproxy-Url header, as originally implemented
+in Danga Interactive's [perlbal](http://www.danga.com/perlbal) load balancer.
+
+By setting the X-Reproxy-Url header, a backend process tells mod\_reproxy
+to serve the response from another location, effectively letting the
+request redirect transparently (and within the same request). This can
+help to reduce load considerably.
+
+
+Installing
+----------
+
+Installation assumes you have [Ruby](http://ruby-lang.org) and
+[Rake](http://github.com/jimweirich/rake) installed. To install mod\_reproxy:
+
+    $ rake all
+
+This will build the module, install it, and restart apache. You can do each
+step separately if you wish:
+
+    $ rake 
+    $ rake install
+    $ rake restart
+
+If anyone is particularly offended by using Rake, you are encouraged to
+submit alternative build files (e.g. makefile, etc.).
+
+
+Enabling Reproxying
+-------------------
+
+By default, reproxying is disabled. However, you can enable it in <Directory>,
+<Files>, and <Location> contexts with the `AllowReproxy` setting:
+
+    <Location />
+      AllowReproxy on
+    </Location>
+
+Reproxying will then be enabled within the context you specified.
+
+
+Reproxying
+----------
+
+If reproxying is enabled for a particular request (see "Enabling Reproxying",
+above), then mod\_reproxy will set the X-Proxy-Capabilities header to
+"reproxy-file". A backend can then use that header to determine whether
+reproxying is allowed for the response.
+
+If the backend determines that reproxying is supported, it may respond with
+an X-Reproxy-Url header that contains a space-delimited list of one or more
+URLs. The body of the response will be ignored in this case.
+
+When mod\_reproxy sees the X-Reproxy-Url header, it will sequentially try
+each of the provided URLs until one is successful. The response will then be
+the body of the reproxied response, with the original response body being
+discarded.
+
+The backend may include any of the following response headers, which will be
+explicitly preserved in the reproxied response:
+
+- Content-Type
+
+Other headers may or may not be preserved. If you have headers you would like
+preserved in the response, please consider patching mod\_reproxy (see below).
+
+
+Hacking
+-------
+
+If you are interested in hacking on mod\_reproxy, either to add new features,
+or to fix bugs, please make sure you have the latest version, found here:
+
+* <http://github.com/jamis/mod_reproxy>
+
+Patches may be submitted via email (<jamis@jamisbuck.org>), or as github
+pull requests.
+
+Likewise, suggestions for improvement or feature requests may be submitted via
+the issue tracker (see above link).
+
+
+License
+-------
+
+mod\_reproxy is released under the terms of the MIT license. Please see the
+accompanying LICENSE file for the full text of the license.
