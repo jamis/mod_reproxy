@@ -40,20 +40,29 @@
 
 /* The configuration data for this module */
 typedef struct reproxy_cfg {
-  int enabled; /* 0 if reproxying is disabled, non-zero otherwise */
+  int enabled;                 /* 0 if reproxying is disabled, non-zero otherwise */
+  apr_array_header_t *headers; /* the list of headers that should be preserved during reproxy */
 } reproxy_cfg;
-
-/* Container describing headers that should be copied into the reproxied
- * response */
-typedef struct header_fixups {
-  char *content_type; /* the content-type from the original response should
-                       * be preserved */
-} header_fixups;
 
 /* Information regarding the current status of the reproxy filter */
 typedef struct reproxy_filter_info {
   int state; /* either FIRST_CALL, NO_REPROXY, or REPROXIED */
 } reproxy_filter_info;
+
+static void*         reproxy_config_init(apr_pool_t* pool, char *x);
+static apr_status_t  reproxy_fixups(request_rec *r);
+static void          reproxy_insert_filter(request_rec *r);
+static proxy_worker* reproxy_initialize_worker(apr_pool_t *pool,
+                       proxy_server_conf *conf, server_rec *server,
+                       const char *url);
+static apr_status_t  reproxy_request_to(request_rec *r, const char *url);
+static const char*   get_reproxy_url(request_rec *r);
+static int           reproxy_request(request_rec *r, const char *url_list);
+static apr_status_t  reproxy_output_filter(ap_filter_t *f, apr_bucket_brigade *b);
+static apr_status_t  reproxy_fix_headers_filter(ap_filter_t *f, apr_bucket_brigade *b);
+static void          reproxy_hooks(apr_pool_t *pool);
+static int           reproxy_restore_header(void *rec, const char *key, const char *value);
+static const char*   reproxy_config_preserve_header(cmd_parms *params, void *mconfig, const char *header);
 
 #define FIRST_CALL 0
 #define NO_REPROXY 1
@@ -70,21 +79,11 @@ static const char* reproxy_url_header = "X-Reproxy-Url";
 static const command_rec reproxy_cmds[] = {
   AP_INIT_FLAG("AllowReproxy", ap_set_flag_slot,
     (void*)APR_OFFSETOF(reproxy_cfg, enabled), ACCESS_CONF,
-    "Allow downstream handlers to request reproxying")
+    "Allow downstream handlers to request reproxying"),
+  AP_INIT_ITERATE("PreserveHeaders", reproxy_config_preserve_header,
+     NULL, ACCESS_CONF,
+     "Specify names of HTTP headers to preserve across a reproxied call")
 };
-
-static void*         reproxy_config_init(apr_pool_t* pool, char *x);
-static apr_status_t  reproxy_fixups(request_rec *r);
-static void          reproxy_insert_filter(request_rec *r);
-static proxy_worker* reproxy_initialize_worker(apr_pool_t *pool,
-                       proxy_server_conf *conf, server_rec *server,
-                       const char *url);
-static apr_status_t  reproxy_request_to(request_rec *r, const char *url);
-static const char*   get_reproxy_url(request_rec *r);
-static int           reproxy_request(request_rec *r, const char *url_list);
-static apr_status_t  reproxy_output_filter(ap_filter_t *f, apr_bucket_brigade *b);
-static apr_status_t  reproxy_fix_headers_filter(ap_filter_t *f, apr_bucket_brigade *b);
-static void          reproxy_hooks(apr_pool_t *pool);
 
 module AP_MODULE_DECLARE_DATA reproxy_module = {
   STANDARD20_MODULE_STUFF,
@@ -96,11 +95,20 @@ module AP_MODULE_DECLARE_DATA reproxy_module = {
   reproxy_hooks
 };
 
+static const char*
+reproxy_config_preserve_header(cmd_parms *params, void *mconfig, const char *header)
+{
+  reproxy_cfg *cfg = (reproxy_cfg*)mconfig;
+  *(char**)apr_array_push(cfg->headers) = apr_pstrdup(cfg->headers->pool, header);
+  return NULL;
+}
+
 static void*
 reproxy_config_init(apr_pool_t* pool, char *x)
 {
   reproxy_cfg *cfg = apr_pcalloc(pool, sizeof(reproxy_cfg));
   cfg->enabled = 0;
+  cfg->headers = apr_array_make(pool, 5, sizeof(char*));
 
   return cfg;
 }
@@ -244,11 +252,23 @@ reproxy_request(request_rec *r, const char *url_list)
   char *list = apr_pstrdup(r->pool, url_list);
   char *state, *url;
   int handled = 0;
-  header_fixups *fixups = apr_pcalloc(r->pool, sizeof(header_fixups));
+  int i;
+  reproxy_cfg *cfg = ap_get_module_config(r->per_dir_config, &reproxy_module);
+  apr_table_t *headers = apr_table_make(r->pool, cfg->headers->nelts);
+  char **header_list = (char**)cfg->headers->elts;
 
-  /* remember the original declared content-type of the response, so we
-   * can restore it in the reproxied response */
-  fixups->content_type = apr_pstrdup(r->pool, r->content_type);
+  /* remember the original declared headers of the response, so we
+   * can restore them in the reproxied response */
+  for(i = 0; i < cfg->headers->nelts; i++) {
+    if(apr_strnatcasecmp(header_list[i], "content-type") == 0) {
+      apr_table_set(headers, "content-type", r->content_type);
+    } else {
+      const char *value = apr_table_get(r->headers_out, header_list[i]);
+      if(value) {
+        apr_table_set(headers, header_list[i], value);
+      }
+    }
+  }
 
   /* remove the reproxy capabilities header, so that we don't need
    * to worry about infinite reproxy loops */
@@ -257,7 +277,7 @@ reproxy_request(request_rec *r, const char *url_list)
   /* add the fix headers filter to the output filter list, so that we
    * can restore the original content_type (and, potentially, other
    * headers) to the response. */
-  ap_add_output_filter(fix_headers_filter, fixups, r, r->connection);
+  ap_add_output_filter(fix_headers_filter, headers, r, r->connection);
 
   /* parse the url_list, which is a space-delimited list of potential
    * urls that the response may be reproxied to. */
@@ -304,17 +324,30 @@ reproxy_output_filter(ap_filter_t *f, apr_bucket_brigade *b)
 static apr_status_t
 reproxy_fix_headers_filter(ap_filter_t *f, apr_bucket_brigade *b)
 {
-  header_fixups *fixups = (header_fixups*)f->ctx;
+  apr_table_t *headers = (apr_table_t*)f->ctx;
 
   /* if the headers have not yet been fixed for this response, then
    * put each saved header back into the response */
 
   if(!apr_table_get(f->r->notes, headers_fixed)) {
-    ap_set_content_type(f->r, fixups->content_type);
+    apr_table_do(reproxy_restore_header, f->r, headers);
     apr_table_set(f->r->notes, headers_fixed, "yes");
   }
 
   return ap_pass_brigade(f->next, b);
+}
+
+static int
+reproxy_restore_header(void *rec, const char *key, const char *value) {
+  request_rec *req = (request_rec*)rec;
+
+  if(apr_strnatcasecmp(key, "content-type") == 0) {
+    ap_set_content_type(req, value);
+  } else {
+    apr_table_set(req->headers_out, key, value);
+  }
+
+  return 0;
 }
 
 static void

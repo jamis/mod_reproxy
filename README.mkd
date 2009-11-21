@@ -60,13 +60,17 @@ each of the provided URLs until one is successful. The response will then be
 the body of the reproxied response, with the original response body being
 discarded.
 
-The backend may include any of the following response headers, which will be
-explicitly preserved in the reproxied response:
+By default, the reproxied response will entirely replace the entire original
+response, including the headers. However, using the `PreserveHeaders` option
+you can indicate which headers from the original response should be
+preserved in the reproxied response. Typically, this will be things like
+`Content-Type`, `Content-Disposition`, and so forth, allowing the backend
+to set those for the reproxied response.
 
-- Content-Type
-
-Other headers may or may not be preserved. If you have headers you would like
-preserved in the response, please consider patching mod\_reproxy (see below).
+    <Location />
+      AllowReproxy on
+      PreserveHeaders Content-Type Content-Disposition
+    </Location>
 
 
 Hacking
