@@ -82,7 +82,8 @@ static const command_rec reproxy_cmds[] = {
     "Allow downstream handlers to request reproxying"),
   AP_INIT_ITERATE("PreserveHeaders", reproxy_config_preserve_header,
      NULL, ACCESS_CONF,
-     "Specify names of HTTP headers to preserve across a reproxied call")
+     "Specify names of HTTP headers to preserve across a reproxied call"),
+  {NULL}
 };
 
 module AP_MODULE_DECLARE_DATA reproxy_module = {
