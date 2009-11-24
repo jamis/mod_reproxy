@@ -1,8 +1,10 @@
 MODNAME="mod_reproxy"
-ENV['LTFLAGS'] = "--tag=CC"
+#ENV['LTFLAGS'] = "--tag=CC"
+APXS=ENV['APXS'] || 'apxs'
+APACHECTL=ENV['APACHECTL'] || 'apachectl'
 
 rule '.la' => ['.c'] do |t|
-  sh "apxs -c #{t.source}"
+  sh "#{APXS} -c -Wc,-g #{t.source}"
 end
 
 desc "Build #{MODNAME}"
@@ -10,12 +12,12 @@ task :default => "#{MODNAME}.la"
 
 desc "Install #{MODNAME}"
 task :install => :default do
-  sh "sudo apxs -i #{MODNAME}.la"
+  sh "sudo #{APXS} -i #{MODNAME}.la"
 end
 
 desc "Restart apache"
 task :restart do
-  sh "sudo -p 'sudo password:' apachectl restart"
+  sh "sudo -p 'sudo password:' #{APACHECTL} restart"
 end
 
 desc "Build and install #{MODNAME}, and restart apache"
